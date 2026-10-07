@@ -1,0 +1,80 @@
+# Pipeline DevSecOps da Loja Demo
+# Os mesmos controlos do ./scan.sh, agora como "quality gates" em cada pull request.
+name: devsecops
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Privilégio mínimo: o GITHUB_TOKEN só pode ler o código.
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      # BOA PRÁTICA: fixar actions de terceiros pelo SHA completo do commit, não pela tag
+      # (ver incidente tj-actions/changed-files, março 2025). Ex.: actions/checkout@<sha> # v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # histórico completo: os secrets também vivem em commits antigos
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            git /repo --no-banner --verbose --redact
+
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: semgrep
+        run: |
+          docker run --rm -v "$PWD:/src" semgrep/semgrep \
+            semgrep scan --config p/python --config p/secrets --metrics=off --error app
+
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy (dependências)
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest \
+            fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 /src/app
+
+  iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy (IaC)
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest \
+            config --severity HIGH,CRITICAL --exit-code 1 /src/infra
+      - name: conftest (políticas da organização)
+        run: |
+          docker run --rm -v "$PWD:/project" openpolicyagent/conftest \
+            test infra/main.tf -p policy --namespace terraform
+          docker run --rm -v "$PWD:/project" openpolicyagent/conftest \
+            test app/Dockerfile -p policy --namespace docker
+
+  # BÓNUS - deploy sem secrets estáticos (OIDC).
+  # O GitHub emite um token de identidade de curta duração; a AWS troca-o por credenciais
+  # temporárias de uma role cuja trust policy só aceita ESTE repositório e ESTE branch.
+  # Não há AWS_ACCESS_KEY_ID guardado em lado nenhum.
+  #
+  # deploy:
+  #   needs: [secrets, sast, sca, iac]
+  #   if: github.ref == 'refs/heads/main'
+  #   runs-on: ubuntu-latest
+  #   environment: producao          # aprovação manual + regras de proteção
+  #   permissions:
+  #     id-token: write              # permite pedir o token OIDC
+  #     contents: read
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: arn:aws:iam::123456789012:role/loja-deploy
+  #         aws-region: eu-west-1
+  #     - run: terraform -chdir=infra init && terraform -chdir=infra apply -auto-approve
